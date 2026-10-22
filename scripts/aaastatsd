@@ -60,11 +60,30 @@ class RadiusStatsFileHandler(FileSystemEventHandler):
         self.radiusStatsInstance = radiusStatsInstance
 
     def on_any_event(self, event):
-        # print("RadiusStatsFileHandler.on_any_event()")
         if event.is_directory:
-            return None
+            return
 
-        self.radiusStatsInstance.handle_update(os.path.basename(event.src_path))
+        # Reading statistics generates opened/closed_no_write events on Linux.
+        # Only changes to file state should trigger another read.
+        if event.event_type == 'moved':
+            paths = [event.src_path, event.dest_path]
+        elif event.event_type in ('created', 'modified', 'deleted'):
+            paths = [event.src_path]
+        else:
+            return
+
+        stats_dir = os.path.abspath(RADIUS_PAM_AUTH_CONF_STATS_DIR)
+        servers = set()
+        for path in paths:
+            if not path:
+                continue
+            path = os.path.abspath(path)
+            if os.path.dirname(path) != stats_dir:
+                continue
+            server = os.path.basename(path)
+            if server not in servers:
+                servers.add(server)
+                self.radiusStatsInstance.handle_update(server)
 
 class RadiusStatsFileMon ():
     def __init__(self, radiusStatsInstance):

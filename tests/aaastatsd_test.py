@@ -144,3 +144,106 @@ def test_clear_only_truncates_local_stats_files(tmp_path):
 
     assert local_file.read_text() == ''
     assert other_file.read_text() == 'keep data'
+
+
+@pytest.mark.parametrize('event_type', ['opened', 'closed_no_write', 'closed',
+                                       'unknown'])
+def test_stats_handler_ignores_non_change_events(event_type):
+    stats = mock.Mock()
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+    event = types.SimpleNamespace(
+        is_directory=False, event_type=event_type,
+        src_path=aaastatsd.RADIUS_PAM_AUTH_CONF_STATS_DIR + '192.0.2.1')
+
+    handler.on_any_event(event)
+
+    stats.handle_update.assert_not_called()
+
+
+@pytest.mark.parametrize('event_type', ['created', 'modified', 'deleted', 'moved'])
+def test_stats_handler_ignores_directory_events(event_type):
+    stats = mock.Mock()
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+
+    handler.on_any_event(types.SimpleNamespace(
+        is_directory=True, event_type=event_type))
+
+    stats.handle_update.assert_not_called()
+
+
+@pytest.mark.parametrize('event_type', ['created', 'modified', 'deleted'])
+def test_stats_handler_updates_changed_file(event_type):
+    stats = mock.Mock()
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+
+    handler.on_any_event(types.SimpleNamespace(
+        is_directory=False, event_type=event_type,
+        src_path=aaastatsd.RADIUS_PAM_AUTH_CONF_STATS_DIR + '192.0.2.1'))
+
+    stats.handle_update.assert_called_once_with('192.0.2.1')
+
+
+@pytest.mark.parametrize('src_path,dest_path,expected', [
+    ('192.0.2.1', '192.0.2.2', ['192.0.2.1', '192.0.2.2']),
+    ('192.0.2.1', '192.0.2.1', ['192.0.2.1']),
+    ('../incoming', '192.0.2.1', ['192.0.2.1']),
+    ('192.0.2.1', '../outgoing', ['192.0.2.1']),
+])
+def test_stats_handler_updates_local_move_endpoints(src_path, dest_path,
+                                                    expected):
+    stats = mock.Mock()
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+    stats_dir = aaastatsd.RADIUS_PAM_AUTH_CONF_STATS_DIR
+
+    handler.on_any_event(types.SimpleNamespace(
+        is_directory=False, event_type='moved',
+        src_path=os.path.join(stats_dir, src_path),
+        dest_path=os.path.join(stats_dir, dest_path)))
+
+    assert stats.handle_update.call_args_list == [mock.call(srv) for srv in expected]
+
+
+def test_stats_handler_ignores_changes_outside_stats_directory():
+    stats = mock.Mock()
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+
+    handler.on_any_event(types.SimpleNamespace(
+        is_directory=False, event_type='modified',
+        src_path='/tmp/192.0.2.1'))
+
+    stats.handle_update.assert_not_called()
+
+
+def test_stats_handler_read_does_not_schedule_another_update(tmp_path):
+    stats_file = tmp_path / '192.0.2.1'
+    stats_file.write_text('0 1 2 3')
+    stats = aaastatsd.RadiusStatistics.__new__(aaastatsd.RadiusStatistics)
+    stats.radius_global = {'statistics': 'True'}
+    stats.radius_counter_names = ['counter_0', 'access_requests',
+                                  'access_accepts', 'access_rejects']
+    handler = aaastatsd.RadiusStatsFileHandler(stats)
+    real_open = builtins.open
+    pending_events = [types.SimpleNamespace(
+        is_directory=False, event_type='modified', src_path=str(stats_file))]
+
+    def read_with_events(*args, **kwargs):
+        pending_events.extend(types.SimpleNamespace(
+            is_directory=False, event_type=event_type, src_path=str(stats_file))
+            for event_type in ('opened', 'closed_no_write'))
+        return real_open(*args, **kwargs)
+
+    with mock.patch.object(aaastatsd, 'RADIUS_PAM_AUTH_CONF_STATS_DIR',
+                           str(tmp_path)), \
+            mock.patch.object(aaastatsd, 'ConfigDBConnector') as connector, \
+            mock.patch.object(builtins, 'open', side_effect=read_with_events):
+        # Bound event processing so a regression fails rather than hanging.
+        for _ in range(10):
+            if not pending_events:
+                break
+            handler.on_any_event(pending_events.pop(0))
+
+        assert pending_events == []
+        connector.return_value.set_entry.assert_called_once_with(
+            'RADIUS_SERVER_STATS', '192.0.2.1', {
+                'counter_0': '0', 'access_requests': '1',
+                'access_accepts': '2', 'access_rejects': '3'})
